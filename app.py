@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import re
 import math
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # ==============================================================================
 # 1. KONFIGURASI UTAMA & DESAIN INTERAKTIF TINGKAT TINGGI (PINK FANTA & SOFT THEME)
@@ -79,6 +81,15 @@ st.markdown("""
     }
     .stButton>button:hover { transform: translateY(-2px) !important; box-shadow: 0 6px 20px rgba(255,0,85,0.4) !important; }
 
+    /* Tombol Unduh (Download) - Disamakan gaya dengan tombol utama */
+    .stDownloadButton>button {
+        background: linear-gradient(135deg, #FF0055 0%, #B8003D 100%) !important;
+        color: white !important; font-weight: 700 !important; border-radius: 12px !important;
+        border: none !important; padding: 12px 24px !important;
+        box-shadow: 0 4px 12px rgba(255,0,85,0.2) !important; transition: all 0.3s !important;
+    }
+    .stDownloadButton>button:hover { transform: translateY(-2px) !important; box-shadow: 0 6px 20px rgba(255,0,85,0.4) !important; }
+
     /* Box Nama Anggota Kelompok */
     .member-box { background: white; padding: 12px; border-radius: 10px; border: 1px solid #FFA6C9; margin-bottom: 8px; font-size: 0.9rem; color: #A30036; font-weight: 600; }
     </style>
@@ -99,6 +110,46 @@ def get_cosine_similarity(vec1, vec2):
     sum2 = sum([vec2[x]**2 for x in vec2.keys()])
     denominator = math.sqrt(sum1) * math.sqrt(sum2)
     return float(numerator) / denominator if denominator else 0.0
+# (Fungsi text_to_vector & get_cosine_similarity manual di atas tidak lagi
+# dipakai untuk pencarian utama sejak memakai TF-IDF vektorisasi di bawah,
+# namun tetap disimpan apabila ingin dipelajari/dibandingkan secara manual.)
+
+
+# ==============================================================================
+# 2B. INDEKS PENCARIAN SUPER CEPAT (TF-IDF + COSINE, DI-CACHE SEKALI SAJA)
+# ==============================================================================
+# Dibangun hanya SATU KALI dan disimpan di cache (bukan dihitung ulang setiap
+# kali user mengetik), sehingga pencarian pada 50.000+ baris data tetap terasa
+# instan/secepat kilat walau database besar.
+@st.cache_resource(show_spinner=False)
+def build_search_index(_df):
+    corpus = (_df['Nama_Prosedur'].fillna('') + ' ' + _df['Kata_Kunci'].fillna(''))
+    vectorizer = TfidfVectorizer()
+    matrix = vectorizer.fit_transform(corpus)
+    return vectorizer, matrix
+
+
+def cari_cepat(df_source, search_input, top_n=10, ambang_skor=0.01):
+    """Pencarian super cepat memakai TF-IDF + cosine similarity yang sudah
+    divektorisasi penuh (tanpa loop Python per-baris), sehingga jauh lebih
+    cepat dibanding pendekatan iterrows() pada data besar."""
+    vectorizer, matrix = build_search_index(df_source)
+    query_vec = vectorizer.transform([search_input])
+    skor_semua = cosine_similarity(query_vec, matrix).flatten()
+
+    df_skor = df_source.copy()
+    df_skor['Skor'] = skor_semua
+    df_skor = df_skor[df_skor['Skor'] > ambang_skor].sort_values('Skor', ascending=False).head(top_n)
+
+    hasil = []
+    for _, row in df_skor.iterrows():
+        hasil.append({
+            'Kode': row['Kode_ICD9'],
+            'Prosedur': row['Nama_Prosedur'],
+            'Rumpun': row['Rumpun_Klinis'],
+            'Skor': row['Skor'],
+        })
+    return hasil
 
 
 # ==============================================================================
@@ -192,6 +243,11 @@ def generate_50000_icd9_data_instan():
 if 'icd9_db' not in st.session_state:
     st.session_state.icd9_db = generate_50000_icd9_data_instan()
 
+# Bangun indeks TF-IDF di awal (sekali saja, di-cache) supaya pencarian
+# PERTAMA KALI pun langsung secepat kilat, tidak perlu menunggu indeks
+# dibangun saat user baru mengetik kata kunci.
+build_search_index(st.session_state.icd9_db)
+
 if 'is_logged_in' not in st.session_state:
     st.session_state.is_logged_in = False
 
@@ -280,36 +336,7 @@ with tab1:
             st.session_state.search_history.append(search_input)
 
         with st.spinner("🔮 Model AI Kelompok 3 sedang mengkalkulasi matriks kosinus teks..."):
-            query_vector = text_to_vector(search_input)
-            scored_results = []
-            
-            words_query = [w.lower() for w in search_input.lower().split() if len(w) > 2]
-            df_source = st.session_state.icd9_db
-            
-            if words_query:
-                regex_pattern = '|'.join([re.escape(w) for w in words_query])
-                mask = (
-                    df_source['Nama_Prosedur'].str.lower().str.contains(regex_pattern, na=False) |
-                    df_source['Kata_Kunci'].str.lower().str.contains(regex_pattern, na=False)
-                )
-                df_filtered = df_source[mask].head(600)  
-            else:
-                df_filtered = df_source.head(100)
-
-            for idx, row in df_filtered.iterrows():
-                target_text = f"{row['Nama_Prosedur']} {row['Kata_Kunci']}"
-                target_vector = text_to_vector(target_text)
-                score = get_cosine_similarity(query_vector, target_vector)
-                
-                if score > 0.01:
-                    scored_results.append({
-                        'Kode': row['Kode_ICD9'],
-                        'Prosedur': row['Nama_Prosedur'],
-                        'Rumpun': row['Rumpun_Klinis'],
-                        'Skor': score
-                    })
-
-            scored_results = sorted(scored_results, key=lambda x: x['Skor'], reverse=True)[:10]
+            scored_results = cari_cepat(st.session_state.icd9_db, search_input, top_n=10, ambang_skor=0.01)
 
         if scored_results:
             st.success(f"⚡ Model AI Berhasil Menemukan {len(scored_results)} Rekomendasi Kode ICD-9 dengan Pencarian Kilat:")
@@ -323,6 +350,34 @@ with tab1:
                     <div class="proc-title">{res['Prosedur']}</div>
                 </div>
                 """, unsafe_allow_html=True)
+
+            # =====================================================================
+            # >>> TAMBAHAN BARU: TOMBOL UNDUH HASIL PENCARIAN (CSV) <<<
+            # Tombol hanya ditampilkan apabila df_hasil_pencarian benar-benar
+            # memiliki baris data, supaya tidak ada file kosong yang ter-download.
+            # =====================================================================
+            st.write("")
+            df_hasil_pencarian = pd.DataFrame(scored_results).rename(columns={
+                'Kode': 'Kode_ICD9',
+                'Prosedur': 'Nama_Prosedur',
+                'Rumpun': 'Rumpun_Klinis',
+                'Skor': 'Skor_Kemiripan'
+            })
+
+            if not df_hasil_pencarian.empty:
+                csv_hasil_pencarian = df_hasil_pencarian.to_csv(index=False).encode('utf-8')
+                nama_file_aman = re.sub(r'[^a-zA-Z0-9_-]', '_', search_input.strip())[:40] or "pencarian"
+
+                st.download_button(
+                    label=f"📥 Unduh {len(df_hasil_pencarian)} Hasil Pencarian Ini (Format .CSV)",
+                    data=csv_hasil_pencarian,
+                    file_name=f"Hasil_Pencarian_ICD9_{nama_file_aman}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="download_hasil_pencarian_tab1"
+                )
+            else:
+                st.caption("Tidak ada data untuk diunduh karena hasil pencarian kosong.")
         else:
             st.markdown(f'<div class="no-result">❌ Model AI tidak menemukan kode ICD-9 yang cocok. Cobalah kata kunci gejala medis lainnya.</div>', unsafe_allow_html=True)
     else:
@@ -349,6 +404,29 @@ with tab_list:
         
     st.write(f"Menampilkan **{len(df_display):,}** dari total **{len(st.session_state.icd9_db):,}** Baris Data:")
     st.dataframe(df_display, use_container_width=True, height=450)
+
+    # =====================================================================
+    # >>> TAMBAHAN BARU: TOMBOL UNDUH HASIL FILTER TABEL (CSV) <<<
+    # Tombol hanya ditampilkan apabila df_display benar-benar memiliki baris
+    # data, supaya tidak ada file kosong yang ter-download.
+    # =====================================================================
+    if not df_display.empty:
+        csv_tabel_filter = df_display.to_csv(index=False).encode('utf-8')
+        label_unduh_tabel = (
+            f"📥 Unduh Hasil Filter \"{filter_keyword}\" ({len(df_display):,} baris) — Format .CSV"
+            if filter_keyword else
+            f"📥 Unduh Seluruh Data Tabel Ini ({len(df_display):,} baris) — Format .CSV"
+        )
+        st.download_button(
+            label=label_unduh_tabel,
+            data=csv_tabel_filter,
+            file_name="Hasil_Filter_Tabel_ICD9.csv" if filter_keyword else "Master_Data_ICD9_Lengkap.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="download_tabel_list"
+        )
+    else:
+        st.caption("Tidak ada data untuk diunduh — coba ubah kata kunci filter kamu.")
 
 
 # ==============================================================================
@@ -433,7 +511,8 @@ with tab3:
         data=csv_data,
         file_name="Laporan_Database_ICD9_Kelompok3.csv",
         mime="text/csv",
-        use_container_width=True
+        use_container_width=True,
+        key="download_master_tab3"
     )
 
 
